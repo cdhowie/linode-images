@@ -1,0 +1,127 @@
+#!/bin/sh
+
+IMG=debian11-btrfs.img
+MNT=/mnt/debian11-btrfs
+
+BTRFSOPTIONS='noatime,compress=zstd'
+
+if [ -e "$IMG" ]; then
+	echo "$0: $IMG already exists" 1>&2
+	exit 1
+fi
+
+# Install tools we need to create the image
+apt-get update || exit 1
+apt-get install --yes btrfs-progs debootstrap || exit 1
+
+# Ensure image mountpoint exists
+mkdir -p "$MNT" || exit 1
+
+# Create 3GB image file
+fallocate --length 3G "$IMG" || exit 1
+
+# Create loop device for the image
+LOOPDEV="$(losetup --find --partscan --show "$IMG")" || exit 1
+
+# Create GPT partition table with appropriate partitions
+sfdisk --quiet "$LOOPDEV" <<TABLE || exit 1
+label: gpt
+unit: sectors
+first-lba: 2048
+last-lba: 6291422
+sector-size: 512
+
+${LOOPDEV}p1 : start=        2048, size=        2048, type=21686148-6449-6E6F-744E-656564454649
+${LOOPDEV}p2 : start=        4096, size=     1048576, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4
+${LOOPDEV}p3 : start=     1052672, size=     5238751, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4
+TABLE
+
+BOOTDEV="${LOOPDEV}p2"
+ROOTDEV="${LOOPDEV}p3"
+
+# Create /boot and / filesystems
+mkfs.ext2 -q "$BOOTDEV" || exit 1
+mkfs.btrfs --quiet --csum xxhash --data single --metadata dup --runtime-features free-space-tree "$ROOTDEV" || exit 1
+
+# Obtain filesystem UUIDs for the image's fstab
+BOOTUUID="$(blkid --match-tag UUID --output value "$BOOTDEV")" || exit 1
+ROOTUUID="$(blkid --match-tag UUID --output value "$ROOTDEV")" || exit 1
+
+# Create subvolume for the system
+mount "$ROOTDEV" "$MNT" -o "$BTRFSOPTIONS" || exit 1
+btrfs --quiet subvolume create "$MNT/@" || exit 1
+btrfs --quiet subvolume set-default "$MNT/@" || exit 1
+umount "$MNT" || exit 1
+
+# Mount the subvolume
+mount "$ROOTDEV" "$MNT" -o "$BTRFSOPTIONS,subvol=@" || exit 1
+
+# Create /boot mountpoint and mount /boot on it
+mkdir "$MNT/boot" || exit 1
+mount "$BOOTDEV" "$MNT/boot" || exit 1
+
+# Bootstrap debian into the image
+debootstrap bullseye "$MNT" || exit 1
+
+# Build fstab
+cat >"$MNT/etc/fstab" <<FSTAB || exit 1
+UUID=$ROOTUUID	/	btrfs	$BTRFSOPTIONS,subvol=@	0	1
+UUID=$BOOTUUID	/boot	ext2	defaults	0	0
+FSTAB
+
+# Bind-mount virtual filesystems (required for grub install)
+for i in dev proc sys; do
+	mount --bind /$i "$MNT/$i" || exit 1
+done || exit 1
+
+# Install additional packages into the image system
+chroot "$MNT" apt-get install --yes btrfs-progs locales grub-pc linux-image-amd64 || exit 1
+
+# Configure grub for btrfs and Linode
+cat >>"$MNT/etc/default/grub" <<GRUB || exit 1
+GRUB_CMDLINE_LINUX="console=ttyS0,19200n8 net.ifnames=0 rootflags=$BTRFSOPTIONS,subvol=@"
+
+# Enable serial console for LISH
+GRUB_GFXPAYLOAD_LINUX=text
+GRUB_TERMINAL=serial
+GRUB_SERIAL_COMMAND="serial --speed=19200 --unit=0 --word=8 --parity=no --stop=1"
+GRUB
+
+# initramfs-tools can't figure out that we need this kernel module in the
+# initrd to support the xxhash checksum algorithm, so force it to include the
+# module
+echo xxhash_generic >>"$MNT/etc/initramfs-tools/modules" || exit 1
+
+# Update initrd and install grub
+chroot "$MNT" update-initramfs -k all -u || exit 1
+chroot "$MNT" grub-install "$LOOPDEV" || exit 1
+chroot "$MNT" update-grub || exit 1
+
+# Set root password
+echo 'root:root' | chroot "$MNT" chpasswd || exit 1
+
+# Empty /etc/resolv.conf, which is copied from the host by debootstrap
+truncate -s 0 "$MNT/etc/resolv.conf" || exit 1
+
+# Install default network config for Linode
+for iface in eth0 eth1 eth2; do
+	cat >>"$MNT/etc/network/interfaces.d/$iface.conf" <<IFACE || exit 1
+allow-hotplug $iface
+iface $iface inet dhcp
+IFACE
+done || exit 1
+
+# Flush filesystem caches and trim to punch holes in our image file
+sync "$MNT/boot" && fstrim "$MNT/boot" || exit 1
+sync "$MNT" && fstrim "$MNT" || exit 1
+
+# Unmount /boot and virtual filesystems
+for i in dev proc sys boot; do
+	umount "$MNT/$i" || exit 1
+done || exit 1
+
+# Unmount /
+umount "$MNT" || exit 1
+
+# Remove loop device
+losetup --detach "$LOOPDEV" || exit 1
