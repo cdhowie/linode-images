@@ -1,7 +1,17 @@
 #!/bin/sh
 
-IMG=debian11-btrfs.img
-MNT=/mnt/debian11-btrfs
+case "$1" in
+    bullseye | bookworm )
+        SUITE="$1"
+        ;;
+    *)
+        echo "$0: Missing/incorrect suite provided." 1>&2
+        exit 1
+        ;;
+esac
+
+IMG="debian-$SUITE-btrfs.img"
+MNT="/mnt/debian-$SUITE-btrfs"
 
 BTRFSOPTIONS='noatime,compress=zstd'
 
@@ -61,7 +71,7 @@ mkdir "$MNT/boot" || exit 1
 mount "$BOOTDEV" "$MNT/boot" || exit 1
 
 # Bootstrap debian into the image
-debootstrap bullseye "$MNT" || exit 1
+debootstrap "$SUITE" "$MNT" || exit 1
 
 # Build fstab
 cat >"$MNT/etc/fstab" <<FSTAB || exit 1
@@ -77,9 +87,12 @@ done || exit 1
 # Install additional packages into the image system
 chroot "$MNT" apt-get install --yes btrfs-progs locales grub-pc linux-image-amd64 || exit 1
 
-# Configure grub for btrfs and Linode
+# Configure grub for btrfs and Linode.
+#
+# For scsi_mod.scan=sync, see
+# https://www.linode.com/community/questions/22853/grub-errors-on-new-server-not-loading-disk-debian-11
 cat >>"$MNT/etc/default/grub" <<GRUB || exit 1
-GRUB_CMDLINE_LINUX="console=ttyS0,19200n8 net.ifnames=0 rootflags=$BTRFSOPTIONS,subvol=@"
+GRUB_CMDLINE_LINUX="console=ttyS0,19200n8 net.ifnames=0 scsi_mod.scan=sync rootflags=$BTRFSOPTIONS,subvol=@"
 
 # Enable serial console for LISH
 GRUB_GFXPAYLOAD_LINUX=text
