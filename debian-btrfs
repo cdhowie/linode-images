@@ -84,6 +84,16 @@ for i in dev proc sys; do
 	mount --bind /$i "$MNT/$i" || exit 1
 done || exit 1
 
+# Set up apt sources and install available upgrades.
+cat >"$MNT/etc/apt/sources.list" <<APT || exit 1
+deb http://ftp.us.debian.org/debian/ $SUITE main
+deb http://security.debian.org/debian-security $SUITE-security main
+deb http://ftp.us.debian.org/debian/ $SUITE-updates main
+APT
+
+chroot "$MNT" apt-get update || exit 1
+chroot "$MNT" apt-get full-upgrade --yes || exit 1
+
 # Install additional packages into the image system
 chroot "$MNT" apt-get install --yes btrfs-progs locales grub-pc linux-image-amd64 || exit 1
 
@@ -115,6 +125,9 @@ echo 'root:root' | chroot "$MNT" chpasswd || exit 1
 
 # Empty /etc/resolv.conf, which is copied from the host by debootstrap
 truncate -s 0 "$MNT/etc/resolv.conf" || exit 1
+
+# Hostname is also copied from the host
+echo "debian-$SUITE-btrfs" >"$MNT/etc/hostname" || exit 1
 
 # Install default network config for Linode
 for iface in eth0 eth1 eth2; do
